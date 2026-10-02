@@ -170,6 +170,7 @@ function makeOkResponse(body: string): Response {
           .mockResolvedValueOnce({ done: false, value: frames })
           .mockResolvedValueOnce({ done: true, value: undefined }),
         releaseLock: () => {},
+        cancel: async () => {},
       }),
       cancel: async () => {},
     },
@@ -249,6 +250,19 @@ describe("Feature 9: Streaming Integration", () => {
     const done = events.find((event) => event.type === "done");
     expect(done?.type === "done" && done.message.content).toEqual([{ type: "text", text: prose }]);
     expect(events.some((event) => event.type === "toolcall_end")).toBe(false);
+    vi.unstubAllGlobals();
+  });
+
+  it("does not replay an attempt after exposing partial text", async () => {
+    const fetch = mockFetchOk('{"content":"partial"}{"error":"synthetic interruption"}');
+    vi.stubGlobal("fetch", fetch);
+    const events = await collect(
+      streamKiro(makeModel({ reasoning: false }), makeContext(), { apiKey: "synthetic-token" }),
+    );
+    expect(fetch).toHaveBeenCalledTimes(1);
+    expect(events.filter((event) => event.type === "start")).toHaveLength(1);
+    expect(events.filter((event) => event.type === "error")).toHaveLength(1);
+    expect(events.filter((event) => event.type === "text_end")).toHaveLength(1);
     vi.unstubAllGlobals();
   });
 
@@ -4294,7 +4308,7 @@ describe("Feature 9: Streaming Integration", () => {
     vi.unstubAllGlobals();
   });
 
-  it("surfaces a mid-stream throttlingError frame and retries", async () => {
+  it("surfaces a mid-stream throttlingError frame without replaying partial output", async () => {
     // throttlingError / validationError / serviceUnavailableError are distinct
     // ChatResponseStream members targeting @error shapes, so the service frames
     // them as `:message-type: exception`. Before key routing they reached the
@@ -4349,9 +4363,9 @@ describe("Feature 9: Streaming Integration", () => {
     const stream = streamKiro(makeModel(), makeContext(), { apiKey: "tok" });
     const events = await collect(stream);
 
-    expect(mockFetch).toHaveBeenCalledTimes(2);
-    const done = events.find((e) => e.type === "done");
-    expect(done?.type === "done" && (done.message.content[0] as TextContent).text).toBe("recovered");
+    expect(mockFetch).toHaveBeenCalledTimes(1);
+    const error = events.find((e) => e.type === "error");
+    expect(error?.type === "error" && error.error.errorMessage).toContain("partial output");
 
     vi.unstubAllGlobals();
   });
@@ -4877,7 +4891,6 @@ describe("Feature 9: Streaming Integration", () => {
                 .mockResolvedValueOnce({
                   done: false,
                   value: concatMessages(
-                    encodeEventMessage({ content: "partial" }),
                     encodeEventMessage({ contextUsagePercentage: 90 }),
                     encodeExceptionMessage("throttlingError", { message: "slow down" }),
                   ),
@@ -5418,7 +5431,7 @@ describe("Feature 9: Streaming Integration", () => {
   // Echo loop detection ("Continue" as entire response)
   // =========================================================================
 
-  it("retries when model responds with just 'Continue' (echo loop detection)", async () => {
+  it("does not replay a visible Continue echo", async () => {
     const echoResponse = '{"content":"Continue"}{"contextUsagePercentage":10}';
     const goodResponse = '{"content":"Here is the actual work."}{"contextUsagePercentage":10}';
 
@@ -5455,12 +5468,11 @@ describe("Feature 9: Streaming Integration", () => {
     const stream = streamKiro(makeModel({ reasoning: false }), makeContext(), { apiKey: "tok" });
     const events = await collect(stream);
 
-    expect(mockFetch).toHaveBeenCalledTimes(2);
+    expect(mockFetch).toHaveBeenCalledTimes(1);
     const done = events.find((e) => e.type === "done");
     expect(done).toBeDefined();
     expect(
-      done?.type === "done" &&
-        done.message.content.some((b) => b.type === "text" && (b as TextContent).text === "Here is the actual work."),
+      done?.type === "done" && done.message.content.some((b) => b.type === "text" && (b as TextContent).text === ""),
     ).toBe(true);
 
     warnSpy.mockRestore();
@@ -5504,11 +5516,10 @@ describe("Feature 9: Streaming Integration", () => {
       const stream = streamKiro(makeModel({ reasoning: false }), makeContext(), { apiKey: "tok" });
       const events = await collect(stream);
 
-      expect(mockFetch).toHaveBeenCalledTimes(2);
+      expect(mockFetch).toHaveBeenCalledTimes(1);
       const done = events.find((e) => e.type === "done");
       expect(
-        done?.type === "done" &&
-          done.message.content.some((b) => b.type === "text" && (b as TextContent).text === "recovered"),
+        done?.type === "done" && done.message.content.some((b) => b.type === "text" && (b as TextContent).text === ""),
       ).toBe(true);
 
       warnSpy.mockRestore();
@@ -5516,7 +5527,7 @@ describe("Feature 9: Streaming Integration", () => {
     }
   }, 30000);
 
-  it("strips echo text after max retries on persistent 'Continue' responses", async () => {
+  it("reports a persistent Continue echo without replaying visible output", async () => {
     const echoResponse = '{"content":"Continue"}{"contextUsagePercentage":10}';
 
     const makeEchoResponse = () => ({
@@ -5544,7 +5555,7 @@ describe("Feature 9: Streaming Integration", () => {
     const events = await collect(stream);
 
     // 1 initial + 3 retries = 4 calls
-    expect(mockFetch).toHaveBeenCalledTimes(4);
+    expect(mockFetch).toHaveBeenCalledTimes(1);
     const done = events.find((e) => e.type === "done");
     expect(done).toBeDefined();
     expect(done?.type === "done" && done.reason).toBe("stop");
@@ -5886,7 +5897,7 @@ describe("Feature 9: Streaming Integration", () => {
     vi.unstubAllGlobals();
   }, 30000);
 
-  it("sets errorMessage when echo-loop retries are exhausted, keeping the stripped text block", async () => {
+  it("reports a visible echo immediately, keeping the stripped text block", async () => {
     const mockFetch = mockFetchRepeated('{"content":"Continue"}{"contextUsagePercentage":10}', 4);
     vi.stubGlobal("fetch", mockFetch);
     const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
@@ -5894,7 +5905,7 @@ describe("Feature 9: Streaming Integration", () => {
     const stream = streamKiro(makeModel({ reasoning: false }), makeContext(), { apiKey: "tok" });
     const events = await collect(stream);
 
-    expect(mockFetch).toHaveBeenCalledTimes(4);
+    expect(mockFetch).toHaveBeenCalledTimes(1);
     const done = events.find((e) => e.type === "done");
     const msg = done?.type === "done" ? done.message : undefined;
     expect(msg?.stopReason).toBe("stop");
@@ -5905,7 +5916,7 @@ describe("Feature 9: Streaming Integration", () => {
     // The new fact names the echo pattern that was stripped.
     expect(msg?.errorMessage).toContain("echoed its own continuation prompt");
     expect(msg?.errorMessage).toContain('"Continue"');
-    expect(msg?.errorMessage).toContain("4 attempts");
+    expect(msg?.errorMessage).toContain("1 attempt");
 
     warnSpy.mockRestore();
     vi.unstubAllGlobals();
@@ -6032,7 +6043,7 @@ describe("Feature 9: Streaming Integration", () => {
     });
     const mockFetch = vi
       .fn()
-      .mockResolvedValueOnce(makeResponse('{"content":"partial"}{"error":"transient"}'))
+      .mockResolvedValueOnce(makeResponse('{"error":"transient"}'))
       .mockResolvedValueOnce(makeResponse(empty))
       .mockResolvedValueOnce(makeResponse(empty))
       .mockResolvedValueOnce(makeResponse(empty));
@@ -6075,7 +6086,7 @@ describe("Feature 9: Streaming Integration", () => {
         cancel: async () => {},
       },
     });
-    const streamErr = '{"content":"partial"}{"error":"transient"}';
+    const streamErr = '{"error":"transient"}';
     const mockFetch = vi
       .fn()
       .mockResolvedValueOnce(makeResponse(streamErr))
@@ -6293,20 +6304,12 @@ describe("Feature 9: Streaming Integration", () => {
     const stream = streamKiro(makeModel({ reasoning: false }), makeContext(), { apiKey: "tok" });
     const events = await collect(stream);
 
-    expect(mockFetch).toHaveBeenCalledTimes(4);
+    expect(mockFetch).toHaveBeenCalledTimes(1);
     const done = events.find((e) => e.type === "done");
     const msg = done?.type === "done" ? done.message : undefined;
-    // Attempt 1 carried text, so only THREE attempts returned no text at all.
-    expect(msg?.errorMessage).toContain("no text and no tool calls on 3 attempts");
-    expect(msg?.errorMessage).not.toContain("4 attempts");
-    // The echoing attempt is still reported — named as its own shape, not merged.
-    expect(msg?.errorMessage).toContain("1 attempt that echoed the continuation prompt");
-    expect(CONSUMER_RETRYABLE_RE.exec(msg?.errorMessage ?? "")?.[0]).toBeUndefined();
-
-    const exhaustionWarning = warnSpy.mock.calls
-      .map((c) => String(c[0]))
-      .find((m) => m.includes("retry budget exhausted"));
-    expect(exhaustionWarning).toContain("Empty response on 3 attempts");
+    expect(msg?.errorMessage).toContain("echoed its own continuation prompt");
+    expect(msg?.errorMessage).toContain("1 attempt");
+    expect(msg?.errorMessage).not.toContain("no text and no tool calls");
 
     warnSpy.mockRestore();
     vi.unstubAllGlobals();
@@ -6478,13 +6481,13 @@ describe("Feature 9: Streaming Integration", () => {
     const stream = streamKiro(makeModel({ reasoning: true }), makeContext(), { apiKey: "tok" });
     const events = await collect(stream);
 
-    expect(mockFetch).toHaveBeenCalledTimes(4);
+    expect(mockFetch).toHaveBeenCalledTimes(1);
     const done = events.find((e) => e.type === "done");
     const msg = done?.type === "done" ? done.message : undefined;
     // Pre-existing contract: the thinking block survives the exhaustion.
     expect(msg?.content.filter((b) => b.type === "thinking")).toHaveLength(1);
     expect(msg?.content.filter((b) => b.type === "text")).toHaveLength(0);
-    expect(msg?.errorMessage).toContain("no text and no tool calls on 4 attempts");
+    expect(msg?.errorMessage).toContain("no text and no tool calls on 1 attempt");
     // Reports what is actually being returned, and does not claim otherwise.
     expect(msg?.errorMessage).toContain("returning only thinking content");
     expect(msg?.errorMessage).not.toContain("empty content");
@@ -6496,7 +6499,7 @@ describe("Feature 9: Streaming Integration", () => {
     vi.unstubAllGlobals();
   }, 30000);
 
-  it("does not say 'no tool calls' and 'returning only toolCall content' in one sentence", async () => {
+  it("returns an error after a published tool call is interrupted", async () => {
     // The first three attempts emit a parseable tool call and then fail
     // mid-stream. #113 clears those abandoned blocks before the terminal
     // degenerate attempt, so the #119 diagnostic must report empty residue.
@@ -6513,20 +6516,16 @@ describe("Feature 9: Streaming Integration", () => {
     const stream = streamKiro(makeModel({ reasoning: false }), makeContext(), { apiKey: "tok" });
     const events = await collect(stream);
 
-    expect(mockFetch).toHaveBeenCalledTimes(4);
-    const done = events.find((e) => e.type === "done");
-    const msg = done?.type === "done" ? done.message : undefined;
-    expect(msg?.content.filter((b) => b.type === "toolCall")).toHaveLength(0);
-    expect(msg?.errorMessage).toContain("no text and no tool calls on 1 attempt;");
-    expect(msg?.errorMessage).toContain("returning empty content");
-    expect(msg?.errorMessage).not.toContain("left by earlier discarded attempts");
-    expect(CONSUMER_RETRYABLE_RE.exec(msg?.errorMessage ?? "")?.[0]).toBeUndefined();
+    expect(mockFetch).toHaveBeenCalledTimes(1);
+    const error = events.find((event) => event.type === "error");
+    expect(error?.type === "error" && error.error.errorMessage).toContain("partial output");
+    expect(events.filter((event) => event.type === "start")).toHaveLength(1);
 
     warnSpy.mockRestore();
     vi.unstubAllGlobals();
   }, 60000);
 
-  it("keeps only the terminal attempt's thinking after earlier stream errors", async () => {
+  it("returns an error rather than retrying a mixed-content partial stream", async () => {
     // The terminal attempt owns the thinking block. #113 has cleared the earlier
     // attempts' text and tool calls, so #119 must not claim stale residue.
     const rich = `{"content":"partial"}${'{"name":"bash","toolUseId":"tc1","input":"{\\"cmd\\":\\"ls\\"}","stop":true}'}{"error":"transient"}`;
@@ -6542,15 +6541,10 @@ describe("Feature 9: Streaming Integration", () => {
     const stream = streamKiro(makeModel({ reasoning: true }), makeContext(), { apiKey: "tok" });
     const events = await collect(stream);
 
-    expect(mockFetch).toHaveBeenCalledTimes(4);
-    const done = events.find((e) => e.type === "done");
-    const msg = done?.type === "done" ? done.message : undefined;
-    expect(msg?.content.filter((b) => b.type === "thinking")).toHaveLength(1);
-    expect(msg?.content.filter((b) => b.type === "text")).toHaveLength(0);
-    expect(msg?.content.filter((b) => b.type === "toolCall")).toHaveLength(0);
-    expect(msg?.errorMessage).toContain("returning only thinking content");
-    expect(msg?.errorMessage).not.toContain("left by earlier discarded attempts");
-    expect(CONSUMER_RETRYABLE_RE.exec(msg?.errorMessage ?? "")?.[0]).toBeUndefined();
+    expect(mockFetch).toHaveBeenCalledTimes(1);
+    const error = events.find((event) => event.type === "error");
+    expect(error?.type === "error" && error.error.errorMessage).toContain("partial output");
+    expect(events.filter((event) => event.type === "start")).toHaveLength(1);
 
     warnSpy.mockRestore();
     vi.unstubAllGlobals();
