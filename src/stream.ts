@@ -8,7 +8,6 @@ import { join } from "node:path";
 import type {
   Api,
   AssistantMessage,
-  AssistantMessageEvent,
   AssistantMessageEventStream,
   Context,
   ImageContent,
@@ -69,6 +68,7 @@ import {
   resolveStreamRetryDelay,
   retryConfig,
 } from "./retry.js";
+import { trackStreamLifecycle } from "./stream-lifecycle.js";
 import { ThinkingTagParser } from "./thinking-parser.js";
 import { kiroTokenTypeHeaders } from "./token-type.js";
 import { countTokens } from "./tokenizer.js";
@@ -549,37 +549,7 @@ function streamKiroWithUsageTracking(
   const StreamCtor = (PiAi as unknown as { AssistantMessageEventStream: new () => AssistantMessageEventStream })
     .AssistantMessageEventStream;
   const stream = new StreamCtor();
-  let started = false;
-  let publishedContent = false;
-  const openBlocks = new Map<number, "text" | "thinking">();
-  const push = stream.push.bind(stream);
-  stream.push = (event) => {
-    // Empty attempts may retry privately; the public stream starts only once.
-    if (event.type === "start") return;
-    if (event.type !== "done" && event.type !== "error") {
-      if (!started && "partial" in event) {
-        started = true;
-        push({ type: "start", partial: event.partial });
-      }
-      publishedContent = true;
-    } else if (event.type === "done" && !started) {
-      started = true;
-      push({ type: "start", partial: event.message });
-    }
-    if (event.type === "text_start") openBlocks.set(event.contentIndex, "text");
-    if (event.type === "thinking_start") openBlocks.set(event.contentIndex, "thinking");
-    if (event.type === "text_end" || event.type === "thinking_end") openBlocks.delete(event.contentIndex);
-    if (event.type === "done" || event.type === "error") {
-      const message = event.type === "done" ? event.message : event.error;
-      for (const [contentIndex, kind] of openBlocks) {
-        const block = message.content[contentIndex];
-        const content = block?.type === "text" ? block.text : block?.type === "thinking" ? block.thinking : "";
-        push({ type: `${kind}_end`, contentIndex, content, partial: message } as AssistantMessageEvent);
-      }
-      openBlocks.clear();
-    }
-    push(event);
-  };
+  const lifecycle = trackStreamLifecycle(stream);
   (async () => {
     const output: AssistantMessage = {
       role: "assistant",
@@ -1562,7 +1532,7 @@ function streamKiroWithUsageTracking(
           throw callerSignal.reason ?? new Error("Request aborted");
         }
         if (firstTokenTimedOut || idleCancelled || streamError) {
-          if (publishedContent) {
+          if (lifecycle.publishedContent) {
             endNativeThinking();
             thinkingParser?.finalize();
             if (textBlockIndex !== null)
@@ -1747,7 +1717,7 @@ function streamKiroWithUsageTracking(
         const degenerate = !explicitStop && ((!hasText && !sawAnyToolCalls) || isEchoLoop);
         if (degenerate && isEchoLoop) echoAttempts++;
         else if (degenerate) emptyAttempts++;
-        const exhausted = degenerate && (publishedContent || retryCount >= maxRetries);
+        const exhausted = degenerate && (lifecycle.publishedContent || retryCount >= maxRetries);
         // Use emittedToolCalls (not toolCalls.length) to avoid stopReason:"toolUse"
         // when all tool calls were skipped due to empty/unparseable input — that
         // combination (empty content + toolUse stop) causes pi's agent loop to
